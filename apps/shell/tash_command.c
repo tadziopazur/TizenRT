@@ -92,6 +92,13 @@ extern tash_taskinfo_t tash_taskinfo_list[];
 static int is_sorted_list = FALSE;
 static struct tash_cmd_info_s tash_cmds_info = {PTHREAD_MUTEX_INITIALIZER};
 
+#ifdef CONFIG_SYSTEM_VI
+int vi_main(int, char **);
+#endif
+#ifdef CONFIG_SYSTEM_I2CTOOL
+int i2c_main(int, char **);
+#endif
+
 const static tash_cmdlist_t tash_basic_cmds[] = {
 	{"exit",  tash_exit,   TASH_EXECMD_SYNC},
 	{"help",  tash_help,   TASH_EXECMD_SYNC},
@@ -101,6 +108,16 @@ const static tash_cmdlist_t tash_basic_cmds[] = {
 #endif
 #if defined(CONFIG_BOARDCTL_RESET)
 	{"reboot", tash_reboot, TASH_EXECMD_SYNC},
+#endif
+	{NULL,    NULL,        0}
+};
+
+const static tash_cmdlist_t tash_extra_cmds[] = {
+#ifdef CONFIG_SYSTEM_VI
+	{"vi", vi_main,  TASH_EXECMD_SYNC},
+#endif
+#ifdef CONFIG_SYSTEM_I2CTOOL
+	{"i2c", i2c_main, TASH_EXECMD_ASYNC},
 #endif
 	{NULL,    NULL,        0}
 };
@@ -330,6 +347,7 @@ void tash_cmdlist_install(const tash_cmdlist_t list[])
 void tash_register_basic_cmds(void)
 {
 	tash_cmdlist_install(tash_basic_cmds);
+	tash_cmdlist_install(tash_extra_cmds);
 }
 
 #if defined(CONFIG_TASH_TELNET_INTERFACE)
