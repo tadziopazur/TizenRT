@@ -37,6 +37,7 @@
 EXTDIR = ${shell pwd}
 -include $(TOPDIR)/Make.defs
 
+TOOLDIR := $(TOPDIR)/../tools
 DELIM ?= $(strip /)
 
 DEPPATH = --dep-path .
@@ -80,9 +81,14 @@ COBJS = $(CSRCS:.c=$(OBJEXT))
 SRCS = $(ASRCS) $(CSRCS)
 OBJS = $(AOBJS) $(COBJS)
 
-BIN	= libexternal$(LIBEXT)
+LIBBUNDLED  := libbundled$(LIBEXT)
+LIBEXTERNAL := libexternal$(LIBEXT)
 
-all:	$(BIN)
+ifeq ($(CONFIG_ENABLE_IOTIVITY),y)
+  LIBIOTIVITY := libiotivity$(LIBEXT)
+endif
+
+all: $(LIBEXTERNAL)
 
 $(AOBJS): %$(OBJEXT): %.S
 	$(call ASSEMBLE, $<, $@)
@@ -101,8 +107,17 @@ ifeq ($(CONFIG_ENABLE_IOTIVITY),y)
 	$(Q) TOPDIR="$(TOPDIR)" $(TOPDIR)/../external/iotivity/build_iotivity.sh
 endif
 
-$(BIN): $(OBJS) iotivity_build
+$(LIBBUNDLED): $(OBJS)
+	@echo "Making $@ out of $(OBJS)"
 	$(call ARCHIVE, $@, $(OBJS))
+
+export CROSSDEV
+EXTLIBS = $(wildcard extlibs/*.[oa])
+$(LIBEXTERNAL): $(LIBBUNDLED) $(EXTLIBS) iotivity_build
+	@echo "Creating library (solid archive) $@ out of $(LIBBUNDLED), $(LIBIOTIVITY) EXTLIBS: $(EXTLIBS)"
+	@echo "CROSSDEV is $(CROSSDEV)"
+	$(TOOLDIR)/create_archive.sh $(LIBEXTERNAL) $(LIBBUNDLED) $(EXTLIBS) $(LIBIOTIVITY)
+	@ls -l $(LIBEXTERNAL) $(LIBBUNDLED)
 
 .depend: Makefile $(SRCS)
 	$(Q) $(MKDEP) $(DEPPATH) "$(CC)" -- $(CFLAGS) -- $(SRCS) >Make.dep
@@ -124,7 +139,7 @@ endif
 endif
 
 custom_clean:
-	$(foreach OBJFILE, $(OBJS), rm -f $(OBJFILE))
+	$(foreach OBJFILE, $(OBJS) $(LIBBUNDLED) $(LIBEXTERNAL), rm -f $(OBJFILE))
 
 clean: custom_clean iotivity_clean
 	$(call DELFILE, $(BIN))
