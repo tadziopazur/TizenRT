@@ -39,6 +39,9 @@ BOARD_DIR_PATH=${BUILD_DIR_PATH}/configs/artik053
 OPENOCD_DIR_PATH=${BOARD_DIR_PATH}/tools/openocd
 FW_DIR_PATH=${BOARD_DIR_PATH}/bin
 
+OPENOCD_ROMFS_NO="set romfs_partition_enable 0"
+OPENOCD_ROMFS_YES="set romfs_partition_enable 1"
+
 CFG_FILE=artik053.cfg
 
 
@@ -119,9 +122,9 @@ function compute_ocd_commands() {
 function setup_romfs_variable() {
 	# Prepare for ROMFS
 	if [ "${CONFIG_FS_ROMFS}" == "y" ]; then
-		OPENOCD_ROMFS_SETUP="set romfs_partition_enable 1; echo \"romfs is enabled\""
+		OPENOCD_ROMFS_SETUP=${OPENOCD_ROMFS_YES}
 	else
-		OPENOCD_ROMFS_SETUP="set romfs_partition_enable 0; echo \"romfs is disabled\""
+		OPENOCD_ROMFS_SETUP=${OPENOCD_ROMFS_NO}
 	fi
 }
 
@@ -139,10 +142,10 @@ function upload_components() {
 function erase_userfs_maybe() {
 	while [ $# -gt 0 ]; do
 		case "${1}" in
-		ERASE_USERFS|erase_userfs)
+		ERASE_USERFS|erase_userfs|ALL)
 			echo "USERFS :"
 			pushd ${OPENOCD_DIR_PATH}
-			${OPENOCD} -f "${CFG_FILE}" -c 'flash_erase_part user;	exit'
+			${OPENOCD} -c "${OPENOCD_ROMFS_NO}" -f "${CFG_FILE}" -c "flash_erase_part user; exit"
 			popd > /dev/null;;
 		*)
 			:;;
