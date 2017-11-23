@@ -102,6 +102,11 @@
  ****************************************************************************/
 /* These are callbacks to notify the upper-half driver of ADC events */
 
+typedef enum {
+  ADC_READ_NEWEST,
+  ADC_READ_OLDEST
+} adc_read_policy_t;
+
 struct adc_dev_s;
 struct adc_callback_s {
 	/*
@@ -132,11 +137,11 @@ struct adc_msg_s {
 /* This describes a FIFO of ADC messages */
 
 struct adc_fifo_s {
-	sem_t   af_sem;		/* Counting semaphore */
-	uint8_t af_head;	/* Index to the head [IN] index in the circular buffer */
-	uint8_t af_tail;	/* Index to the tail [OUT] index in the circular buffer */
-	/* Circular buffer of CAN messages */
-	struct  adc_msg_s af_buffer[CONFIG_ADC_FIFOSIZE];
+	sem_t    sem;	/* Counting semaphore */
+	uint32_t head;	/* Index to the head [IN] index in the circular buffer */
+	/* Circular buffer of messages. Incoming message gets added into samples[head % FIFIOSIZE].
+     * Clients should pick a sample from samples[client_index % FIFOSIZE] */
+	struct adc_msg_s samples[CONFIG_ADC_FIFOSIZE];
 };
 
 /*
@@ -203,10 +208,10 @@ struct adc_dev_s {
 	/* Fields managed by common upper half ADC logic */
 
 	uint8_t           ad_ocount;     /* The number of times the device has been opened */
-	uint8_t           ad_nrxwaiters; /* Number of threads waiting to enqueue a message */
+	uint8_t           ad_nrxwaiters; /* Number of threads waiting for a sample */
 	sem_t             ad_closesem;   /* Locks out new opens while close is in progress */
 	sem_t             ad_recvsem;    /* Used to wakeup user waiting for space in ad_recv.buffer */
-	struct adc_fifo_s ad_recv;       /* Describes receive FIFO */
+	struct adc_fifo_s ad_fifo;       /* Describes receive FIFO */
 #endif
 
 	/* Fields provided by lower half ADC logic */

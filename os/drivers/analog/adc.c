@@ -75,6 +75,7 @@
 
 #include <tinyara/fs/fs.h>
 #include <tinyara/arch.h>
+#include <tinyara/kmalloc.h>
 #include <tinyara/semaphore.h>
 #include <tinyara/analog/adc.h>
 
@@ -107,12 +108,29 @@ static const struct file_operations g_adc_fops = {
 };
 
 static const struct adc_callback_s g_adc_callback = {
-	adc_receive	/* au_receive */
+	.au_receive = adc_receive
 };
+
+typedef struct adc_client_state_s {
+  int               read_idx;    /* zero based sample no. */
+  adc_read_policy_t read_policy; /* oldest, newest */
+  //adc_data_type_t   data_type; /* {s,u}{8,16,32} */
+  struct adc_msg_s  last_sample; /* */
+  int               bytes_left;  /* how much data is left to read from last_sample */
+} adc_client_state_t;
 
 /****************************************************************************
  * Private Functions
  ****************************************************************************/
+static adc_client_state_t *adc_create_clientstate(
+    int read_index, adc_read_policy_t read_policy) {
+  adc_client_state_t *client = (adc_client_state_t *)kmm_malloc(sizeof(adc_client_state_t));
+  client->read_idx = read_index;
+  client->read_policy = read_policy;
+  client->bytes_left = 0;
+  return client;
+}
+
 /****************************************************************************
  * Name: adc_open
  *
@@ -157,8 +175,7 @@ static int adc_open(FAR struct file *filep)
 				ret = dev->ad_ops->ao_setup(dev);
 				if (ret == OK) {
 					/* Mark the FIFOs empty */
-					dev->ad_recv.af_head = 0;
-					dev->ad_recv.af_tail = 0;
+					dev->ad_fifo.head = 0;
 
 					/*
 					 * Finally, Enable the ADC RX
@@ -172,6 +189,20 @@ static int adc_open(FAR struct file *filep)
 
 				irqrestore(flags);
 			}
+            if (ret == OK) {
+              // TODO: handle multiple WROK opens, maybe (how device control behaves?)
+              if (filep->f_oflags & O_RDOK) {
+                int oldest_sample_index = 0;
+                if (dev->ad_fifo.head >= CONFIG_ADC_FIFOSIZE) {
+                  oldest_sample_index = dev->ad_fifo.head - CONFIG_ADC_FIFOSIZE + 1;
+                }
+                filep->f_priv = adc_create_clientstate(
+                    oldest_sample_index, ADC_READ_OLDEST);
+                // TODO: handle error[s]
+              } else {
+                filep->f_priv = NULL;
+              }
+            }
 		}
 
 		sem_post(&dev->ad_closesem);
@@ -216,126 +247,116 @@ static int adc_close(FAR struct file *filep)
 
 			sem_post(&dev->ad_closesem);
 		}
+        if (filep->f_priv) {
+            kmm_free(filep->f_priv);
+        }
 	}
 
 	return ret;
 }
 
+static int adc_waitfor_samples(FAR struct adc_dev_s *dev,
+                               int blocking,
+                               FAR adc_client_state_t *client) {
+  while (client->read_idx > dev->ad_fifo.head) {
+    if (!blocking) {
+      return -EAGAIN;
+    } else {
+      /* Wait for a message to be received */
+      ++dev->ad_nrxwaiters;
+      int ret = sem_wait(&dev->ad_fifo.sem);
+      --dev->ad_nrxwaiters;
+      if (ret < 0) {
+        return -errno;
+      }
+    }
+  }
+  return 0;
+}
+
+static ssize_t adc_partial_read(FAR adc_client_state_t *client,
+                                FAR char *buffer, size_t buflen) {
+  const uint8_t *puc = (const uint8_t *)&client->last_sample;
+  size_t offset = sizeof(client->last_sample) - client->bytes_left;
+  size_t chunk = client->bytes_left < buflen ? client->bytes_left : buflen;
+  memcpy(buffer, puc + offset, chunk);
+  client->bytes_left -= chunk;
+  return buflen;
+}
+
+static ssize_t adc_read_samples(FAR struct adc_fifo_s *fifo,
+                                FAR adc_client_state_t *client,
+                                char *buffer,
+                                size_t buflen) {
+  int requested_samples = buflen / sizeof(struct adc_msg_s);
+  if (requested_samples > fifo->head - client->read_idx) {
+    // There are less samples than requested, clip the request.
+    requested_samples = fifo->head - client->read_idx;
+  }
+  if (requested_samples == 0) return 0;
+
+  int index = client->read_idx % CONFIG_ADC_FIFOSIZE;
+  int sample_count = 0;
+  while (sample_count++ < requested_samples) {
+    memcpy(buffer, &fifo->samples[index], sizeof(struct adc_msg_s));
+    buffer += sizeof(struct adc_msg_s);
+    buflen -= sizeof(struct adc_msg_s);
+    if (++index == CONFIG_ADC_FIFOSIZE) index = 0;
+  }
+  client->read_idx += sample_count;
+  return sample_count * sizeof(struct adc_msg_s);
+}
+
 /****************************************************************************
  * Name: adc_read
  ****************************************************************************/
-static ssize_t adc_read(FAR struct file *filep, FAR char *buffer,
-			size_t buflen)
+static ssize_t adc_read(FAR struct file *filep, FAR char *buffer, size_t buflen)
 {
+    FAR adc_client_state_t *client = filep->f_priv;
 	FAR struct inode     *inode = filep->f_inode;
 	FAR struct adc_dev_s *dev   = inode->i_private;
-	size_t                nread;
 	irqstate_t            flags;
 	int                   ret   = 0;
-	int                   msglen;
+
+    if (!buflen) return 0;
+    if (!buffer) return -EFAULT;
+    if (!client) return -EINVAL;
 
 	avdbg("buflen: %d\n", (int)buflen);
+    // In case client did a partial read before, continue where they left.
+    if (client->bytes_left > 0) {
+      return adc_partial_read(client, buffer, buflen);
+    }
 
-	if (buflen % 5 == 0)
-		msglen = 5;
-	else if (buflen % 4 == 0)
-		msglen = 4;
-	else if (buflen % 3 == 0)
-		msglen = 3;
-	else if (buflen % 2 == 0)
-		msglen = 2;
-	else if (buflen == 1)
-		msglen = 1;
-	else
-		msglen = 5;
+    flags = irqsave();
+    // Wait for the queue to have some data for us
+    ret = adc_waitfor_samples(
+        dev, ((filep->f_oflags) & O_NONBLOCK) == 0, client);
+    if (ret < 0) {
+      goto return_with_irqdisabled;
+    }
 
-	if (buflen >= msglen) {
-		/*
-		 * Interrupts must be disabled while accessing the ad_recv
-		 * FIFO
-		 */
-		flags = irqsave();
-		while (dev->ad_recv.af_head == dev->ad_recv.af_tail) {
-			/*
-			 * The receive FIFO is empty
-			 * -- was non-blocking mode selected?
-			 */
-			if (filep->f_oflags & O_NONBLOCK) {
-				ret = -EAGAIN;
-				goto return_with_irqdisabled;
-			}
+    // Adjust client index; it might have fallen behind the window.
+    if (client->read_idx < dev->ad_fifo.head - CONFIG_ADC_FIFOSIZE + 1) {
+      client->read_idx = dev->ad_fifo.head - CONFIG_ADC_FIFOSIZE + 1;
+    }
 
-			/* Wait for a message to be received */
-			dev->ad_nrxwaiters++;
-			ret = sem_wait(&dev->ad_recv.af_sem);
-			dev->ad_nrxwaiters--;
-			if (ret < 0) {
-				ret = -errno;
-				goto return_with_irqdisabled;
-			}
-		}
+    // Now read as many samples as the client requested
+    // (but not more than the queue holds).
+    ret = adc_read_samples(&dev->ad_fifo, client, buffer, buflen);
 
-		/*
-		 * The ad_recv FIFO is not empty.
-		 * Copy all buffered data that will fit in the user buffer.
-		 */
-		nread = 0;
-		do {
-			FAR struct adc_msg_s *msg =
-				&dev->ad_recv.af_buffer[dev->ad_recv.af_head];
-
-			/*
-			 * Will the next message in the FIFO fit into the
-			 * user buffer?
-			 */
-			if (nread + msglen > buflen) {
-				/*
-				 * No.. break out of the loop now with nread
-				 * equal to the actual number of bytes
-				 * transferred.
-				 */
-				break;
-			}
-
-			/* Copy the message to the user buffer */
-			if (msglen == 1) {
-				/* Only one channel,read highest 8-bits */
-				buffer[nread] = msg->am_data >> 24;
-			} else if (msglen == 2) {
-				/* Only one channel, read highest 16-bits */
-				*(int16_t *)&buffer[nread] =
-							msg->am_data >> 16;
-			} else if (msglen == 3) {
-				/* Read channel highest 16-bits */
-				buffer[nread] = msg->am_channel;
-				*(int16_t *)&buffer[nread + 1] =
-							msg->am_data >> 16;
-			} else if (msglen == 4) {
-				/* read channel highest 24-bits */
-				*(int32_t *)&buffer[nread] = msg->am_data;
-				buffer[nread] = msg->am_channel;
-			} else {
-				/* Read all */
-				*(int32_t *)&buffer[nread + 1] = msg->am_data;
-				buffer[nread] = msg->am_channel;
-			}
-			nread += msglen;
-
-			/* Increment the head of the circular message buffer */
-			if (++dev->ad_recv.af_head >= CONFIG_ADC_FIFOSIZE) {
-				dev->ad_recv.af_head = 0;
-			}
-		} while (dev->ad_recv.af_head != dev->ad_recv.af_tail);
-
-		/*
-		 * All on the messages have bee transferred.
-		 * Return the number of bytes that were read.
-		 */
-		ret = nread;
+    if (ret == 0) {
+      // Partial read. Copy the sample into client state first.
+      int index = client->read_idx % CONFIG_ADC_FIFOSIZE;
+      memcpy(&client->last_sample, &dev->ad_fifo.samples[index],
+          sizeof(struct adc_msg_s));
+      client->bytes_left = sizeof(struct adc_msg_s);
+      ++client->read_idx;
+      ret = adc_partial_read(client, buffer, buflen);
+    }
 
 return_with_irqdisabled:
-		irqrestore(flags);
-	}
+	irqrestore(flags);
 
 	avdbg("Returning: %d\n", ret);
 	return ret;
@@ -350,6 +371,7 @@ static int adc_ioctl(FAR struct file *filep, int cmd, unsigned long arg)
 	FAR struct adc_dev_s *dev = inode->i_private;
 	int ret;
 
+    // TODO: handle data format/policy.
 	ret = dev->ad_ops->ao_ioctl(dev, cmd, arg);
 	return ret;
 }
@@ -359,36 +381,26 @@ static int adc_ioctl(FAR struct file *filep, int cmd, unsigned long arg)
  ****************************************************************************/
 static int adc_receive(FAR struct adc_dev_s *dev, uint8_t ch, int32_t data)
 {
-	FAR struct adc_fifo_s *fifo = &dev->ad_recv;
-	int                    nexttail;
-	int                    errcode = -ENOMEM;
+	FAR struct adc_fifo_s *fifo = &dev->ad_fifo;
 
-	/*
-	 * Check if adding this new message would over-run the drivers
-	 * ability to enqueue read data.
-	 */
-	nexttail = fifo->af_tail + 1;
-	if (nexttail >= CONFIG_ADC_FIFOSIZE) {
-		nexttail = 0;
+    // Add the sample at the head of the queue.
+    // Do not worry about overwriting previous samples, as we'd
+    // rather produce more up-to-date samples than  stall the capturing.
+
+    int index = fifo->head % CONFIG_ADC_FIFOSIZE;
+
+	irqstate_t flags = irqsave();
+
+    fifo->samples[index].am_channel = ch;
+    fifo->samples[index].am_data = data;
+    ++fifo->head;
+
+	irqrestore(flags);
+
+	if (dev->ad_nrxwaiters > 0) {
+	  sem_post(&fifo->sem);
 	}
-
-	/* Refuse the new data if the FIFO is full */
-	if (nexttail != fifo->af_head) {
-		/* Add the new, decoded ADC sample at the tail of the FIFO */
-		fifo->af_buffer[fifo->af_tail].am_channel = ch;
-		fifo->af_buffer[fifo->af_tail].am_data    = data;
-
-		/* Increment the tail of the circular buffer */
-		fifo->af_tail = nexttail;
-
-		if (dev->ad_nrxwaiters > 0) {
-			sem_post(&fifo->af_sem);
-		}
-
-		errcode = OK;
-	}
-
-	return errcode;
+	return OK;
 }
 
 /****************************************************************************
@@ -416,14 +428,14 @@ int adc_register(FAR const char *path, FAR struct adc_dev_s *dev)
 	dev->ad_ocount = 0;
 
 	/* Initialize semaphores */
-	sem_init(&dev->ad_recv.af_sem, 0, 0);
+	sem_init(&dev->ad_fifo.sem, 0, 0);
 	sem_init(&dev->ad_closesem, 0, 1);
 
 	/*
 	 * The receive semaphore is used for signaling and, hence,
 	 * should not have priority inheritance enabled.
 	 */
-	sem_setprotocol(&dev->ad_recv.af_sem, SEM_PRIO_NONE);
+	sem_setprotocol(&dev->ad_fifo.sem, SEM_PRIO_NONE);
 
 	/* Reset the ADC hardware */
 	DEBUGASSERT(dev->ad_ops->ao_reset != NULL);
@@ -432,7 +444,7 @@ int adc_register(FAR const char *path, FAR struct adc_dev_s *dev)
 	/* Register the ADC character driver */
 	ret = register_driver(path, &g_adc_fops, 0444, dev);
 	if (ret < 0) {
-		sem_destroy(&dev->ad_recv.af_sem);
+		sem_destroy(&dev->ad_fifo.sem);
 		sem_destroy(&dev->ad_closesem);
 	}
 
