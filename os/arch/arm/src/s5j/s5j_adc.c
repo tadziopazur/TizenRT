@@ -58,6 +58,7 @@
 #include <assert.h>
 #include <debug.h>
 #include <errno.h>
+#include <stdio.h>
 
 #include <tinyara/irq.h>
 #include <tinyara/wqueue.h>
@@ -82,6 +83,7 @@ struct s5j_dev_s {
 	uint8_t cchannels;	/* Number of configured channels */
 	uint8_t current;	/* Current ADC channel being converted */
 
+	int    irq_count;
 	struct work_s work;	/* Supports the IRQ handling */
 	uint8_t chanlist[S5J_ADC_MAX_CHANNELS];
 };
@@ -132,6 +134,8 @@ static void adc_conversion(void *arg)
 
 	/* Exit, start a new conversion */
 	modifyreg32(S5J_ADC_CON1, 0, ADC_CON1_STCEN_ENABLE);
+
+	up_enable_irq(IRQ_ADC);
 }
 
 /****************************************************************************
@@ -154,6 +158,14 @@ static int adc_interrupt(int irq, FAR void *context, void *arg)
 		/* Clear interrupt pending */
 		putreg32(ADC_INT_STATUS_PENDING, S5J_ADC_INT_STATUS);
 
+		if (priv->irq_count++ == 0) {
+			// Drop the first sample, as it is often incorrect.
+			(void)getreg32(S5J_ADC_DAT);
+			modifyreg32(S5J_ADC_CON1, 0, ADC_CON1_STCEN_ENABLE);
+			return OK;
+		}
+
+		up_disable_irq(IRQ_ADC);
 		/*
 		 * Check if interrupt work is already queued. If it is already
 		 * busy, then we already have interrupt processing in the
@@ -164,7 +176,10 @@ static int adc_interrupt(int irq, FAR void *context, void *arg)
 							priv, 0);
 			if (ret != 0) {
 				lldbg("ERROR: failed to queue work: %d\n", ret);
+				up_enable_irq(IRQ_ADC);
 			}
+		} else {
+			up_enable_irq(IRQ_ADC);
 		}
 	}
 
@@ -264,7 +279,7 @@ static int adc_set_ch(FAR struct adc_dev_s *dev, uint8_t ch)
  *
  ****************************************************************************/
 static int adc_bind(FAR struct adc_dev_s *dev,
-		    FAR const struct adc_callback_s *callback)
+			FAR const struct adc_callback_s *callback)
 {
 	FAR struct s5j_dev_s *priv = (FAR struct s5j_dev_s *)dev->ad_priv;
 
@@ -322,6 +337,8 @@ static int adc_setup(FAR struct adc_dev_s *dev)
 	int ret;
 	FAR struct s5j_dev_s *priv = (FAR struct s5j_dev_s *)dev->ad_priv;
 
+	fprintf(stderr, "ADC setup\n");
+	priv->irq_count = 0;
 	/* Attach the ADC interrupt */
 	ret = irq_attach(IRQ_ADC, adc_interrupt, priv);
 	if (ret < 0) {
@@ -339,6 +356,9 @@ static int adc_setup(FAR struct adc_dev_s *dev)
 	llwdbg("Enable the ADC interrupt: irq=%d\n", IRQ_ADC);
 	up_enable_irq(IRQ_ADC);
 
+	putreg32(ADC_INT_ENABLE, S5J_ADC_INT);
+
+	modifyreg32(S5J_ADC_CON1, 0, ADC_CON1_STCEN_ENABLE);
 	return OK;
 }
 
@@ -361,10 +381,18 @@ static void adc_shutdown(FAR struct adc_dev_s *dev)
 
 	/* Disable ADC interrupts and detach the ADC interrupt handler */
 	up_disable_irq(IRQ_ADC);
-	irq_detach(IRQ_ADC);
+
+	/* Disable interrupt */
+	putreg32(ADC_INT_DISABLE, S5J_ADC_INT);
 
 	/* Reset ADC */
 	putreg32(ADC_CON1_SOFTRESET_RESET, S5J_ADC_CON1);
+
+	if (getreg32(S5J_ADC_INT_STATUS) & ADC_INT_STATUS_PENDING) {
+		putreg32(ADC_INT_STATUS_PENDING, S5J_ADC_INT_STATUS);
+	}
+
+	irq_detach(IRQ_ADC);
 }
 
 /****************************************************************************
@@ -456,7 +484,7 @@ static struct adc_dev_s g_adcdev;
  *
  ****************************************************************************/
 struct adc_dev_s *s5j_adc_initialize(FAR const uint8_t *chanlist,
-				     int cchannels)
+					 int cchannels)
 {
 	FAR struct s5j_dev_s *priv = &g_adcpriv;
 
@@ -468,6 +496,8 @@ struct adc_dev_s *s5j_adc_initialize(FAR const uint8_t *chanlist,
 	priv->cb         = NULL;
 	priv->dev        = &g_adcdev;
 	priv->cchannels  = cchannels;
+
+	priv->irq_count = 0;
 
 	if (cchannels > S5J_ADC_MAX_CHANNELS) {
 		lldbg("S5J has maximum %d ADC channels.\n",
